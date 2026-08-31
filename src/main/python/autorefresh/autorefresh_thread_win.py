@@ -15,6 +15,9 @@ def device_changed(hwnd, msg, wp, lp):
     global g_device_changes
     if wp in [win32con.DBT_DEVICEARRIVAL, win32con.DBT_DEVICEREMOVECOMPLETE]:
         g_device_changes += 1
+    # wndproc callbacks must return an integer LRESULT; returning None raises
+    # "TypeError: WPARAM is simple, so must be an int object" on pywin32 >= 306
+    return 0
 
 
 class AutorefreshThreadWin(AutorefreshThread):
