@@ -9,9 +9,13 @@ Wire format (same command ids as the legacy lighting commands):
     SAVE [0x09, channel]
 
 Supported item types: toggle, range, dropdown and color (hue/sat pair).
-"offset" on a range is a vial-gui extension: the displayed value is the wire
-value plus the offset (e.g. sleep timeout stored as minutes-1).
+Items may carry a "showIf" expression (VIA syntax: {id_name} references to
+other commands' current values, ==/!=/&&/|| and parentheses) controlling
+their visibility; hidden items are skipped when saving.
 """
+import ast
+import re
+
 from PyQt5 import QtCore
 from PyQt5.QtCore import pyqtSignal, QObject
 from PyQt5.QtWidgets import QVBoxLayout, QCheckBox, QGridLayout, QLabel, QWidget, QSizePolicy, QTabWidget, QSpinBox, \
@@ -20,6 +24,68 @@ from PyQt5.QtWidgets import QVBoxLayout, QCheckBox, QGridLayout, QLabel, QWidget
 from editor.basic_editor import BasicEditor
 from util import tr
 from vial_device import VialKeyboard
+
+_SHOWIF_REF = re.compile(r"\{(\w+)\}")
+
+
+def _safe_eval_bool(expr):
+    """Evaluate an integer/boolean expression over ==/!=/</<=/>/>=/and/or/not/parens only"""
+    tree = ast.parse(expr, mode="eval")
+
+    def ev(node):
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.BoolOp):
+            values = [ev(v) for v in node.values]
+            return all(values) if isinstance(node.op, ast.And) else any(values)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return not ev(node.operand)
+        if isinstance(node, ast.Compare):
+            left = ev(node.left)
+            for op, comp in zip(node.ops, node.comparators):
+                right = ev(comp)
+                if isinstance(op, ast.Eq):
+                    result = left == right
+                elif isinstance(op, ast.NotEq):
+                    result = left != right
+                elif isinstance(op, ast.Lt):
+                    result = left < right
+                elif isinstance(op, ast.LtE):
+                    result = left <= right
+                elif isinstance(op, ast.Gt):
+                    result = left > right
+                elif isinstance(op, ast.GtE):
+                    result = left >= right
+                else:
+                    raise ValueError("unsupported operator")
+                if not result:
+                    return False
+                left = right
+            return True
+        if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+            return node.value
+        raise ValueError("unsupported showIf expression: %s" % expr)
+
+    return ev(tree)
+
+
+def eval_showif(expr, values):
+    """Evaluate a VIA showIf expression such as '{id_a} == 0 || {id_b} == 2'.
+
+    values maps command names (content[0]) to their current integer wire value;
+    unknown references read as 0. Syntax errors fail open (returns True).
+    """
+    if not expr:
+        return True
+
+    def repl(m):
+        return str(values.get(m.group(1), 0))
+
+    py = _SHOWIF_REF.sub(repl, expr.replace("||", " or ").replace("&&", " and "))
+    try:
+        return bool(_safe_eval_bool(py))
+    except (ValueError, SyntaxError):
+        return True
 
 
 class CustomOption(QObject):
@@ -41,6 +107,10 @@ class CustomOption(QObject):
         self.lbl = QLabel(item["label"])
         self.container.addWidget(self.lbl, self.row, 0)
 
+        self.showif = item.get("showIf")
+        self.visible = True
+        self._widgets = [self.lbl]
+
         self.value = b""
 
     def wire_value(self):
@@ -55,6 +125,11 @@ class CustomOption(QObject):
 
     def dirty(self):
         return self.wire_value() != self.value
+
+    def set_visible(self, visible):
+        self.visible = visible
+        for w in self._widgets:
+            w.setVisible(visible)
 
     def delete(self):
         self.lbl.hide()
@@ -72,6 +147,7 @@ class ToggleOption(CustomOption):
         self.checkbox = QCheckBox()
         self.checkbox.stateChanged.connect(self.on_change)
         self.container.addWidget(self.checkbox, self.row, 1)
+        self._widgets.append(self.checkbox)
 
     def wire_value(self):
         return bytes([int(self.checkbox.isChecked())])
@@ -101,6 +177,7 @@ class RangeOption(CustomOption):
         self.spinbox.setMaximum(hi + self.offset)
         self.spinbox.valueChanged.connect(self.on_change)
         self.container.addWidget(self.spinbox, self.row, 1)
+        self._widgets.append(self.spinbox)
 
     def wire_value(self):
         v = self.spinbox.value() - self.offset
@@ -137,6 +214,11 @@ class DropdownOption(CustomOption):
                 self.combobox.addItem(opt[0])
         self.combobox.currentIndexChanged.connect(self.on_change)
         self.container.addWidget(self.combobox, self.row, 1)
+        self._widgets.append(self.combobox)
+        # set when the loaded value has no entry in this dropdown's choices
+        # (possible for one of several controls sharing a command while
+        # another variant is active); suppress dirty until the user picks
+        self._unresolved = False
 
     def wire_value(self):
         return self.choices[self.combobox.currentIndex()]
@@ -145,10 +227,18 @@ class DropdownOption(CustomOption):
         super().reload(keyboard)
         self.combobox.blockSignals(True)
         index = 0
-        if self.value in self.choices:
+        self._unresolved = self.value not in self.choices
+        if not self._unresolved:
             index = self.choices.index(self.value)
         self.combobox.setCurrentIndex(index)
         self.combobox.blockSignals(False)
+
+    def on_change(self):
+        self._unresolved = False
+        super().on_change()
+
+    def dirty(self):
+        return not self._unresolved and super().dirty()
 
     def delete(self):
         super().delete()
@@ -175,6 +265,7 @@ class ColorOption(CustomOption):
         layout.addWidget(self.sat)
         w.setLayout(layout)
         self.container.addWidget(w, self.row, 1)
+        self._widgets.append(w)
 
     def wire_value(self):
         return bytes([self.hue.value(), self.sat.value()])
@@ -290,14 +381,38 @@ class CustomSettings(BasicEditor):
 
         self.on_change()
 
+    def apply_visibility(self):
+        """ Re-evaluate showIf for every item against current command values.
+
+        Values come from the widget state for visible+dirty items and from the
+        last value read from the keyboard otherwise, so stale hidden widgets
+        (e.g. a variant dropdown whose choices don't contain the active wire
+        value) never feed the expressions.
+        """
+        values = {}
+        for tab in self.tabs:
+            for opt in tab:
+                v = opt.wire_value() if (opt.visible and opt.dirty()) else opt.value
+                v = int.from_bytes(v or b"\x00", byteorder="big")
+                # several controls may share one command (e.g. the color
+                # variant dropdowns); the visible+dirty one reflects the
+                # user's edit and must not be overwritten by hidden widgets
+                if opt.name not in values or (opt.visible and opt.dirty()):
+                    values[opt.name] = v
+        for tab in self.tabs:
+            for opt in tab:
+                if opt.showif:
+                    opt.set_visible(eval_showif(opt.showif, values))
+
     def on_change(self):
+        self.apply_visibility()
         for x, tab in enumerate(self.tabs):
             title = self.tabs_widget.tabText(x).rstrip("*")
-            if any(opt.dirty() for opt in tab):
+            if any(opt.dirty() and opt.visible for opt in tab):
                 title += "*"
             self.tabs_widget.setTabText(x, title)
 
-        changed = any(opt.dirty() for tab in self.tabs for opt in tab)
+        changed = any(opt.dirty() and opt.visible for tab in self.tabs for opt in tab)
         self.btn_save.setEnabled(changed)
 
     def rebuild(self, device):
@@ -310,7 +425,7 @@ class CustomSettings(BasicEditor):
         channels = set()
         for tab in self.tabs:
             for opt in tab:
-                if opt.dirty():
+                if opt.dirty() and opt.visible:
                     self.keyboard.custom_set_value(opt.channel, opt.value_id, opt.wire_value())
                     opt.sync()
                     channels.add(opt.channel)
