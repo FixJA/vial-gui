@@ -16,7 +16,7 @@ from protocol.constants import CMD_VIA_GET_PROTOCOL_VERSION, CMD_VIA_GET_KEYBOAR
     VIALRGB_GET_SUPPORTED, VIALRGB_SET_MODE, CMD_VIAL_GET_KEYBOARD_ID, CMD_VIAL_GET_SIZE, CMD_VIAL_GET_DEFINITION, \
     CMD_VIAL_GET_ENCODER, CMD_VIAL_SET_ENCODER, CMD_VIAL_GET_UNLOCK_STATUS, CMD_VIAL_UNLOCK_START, CMD_VIAL_UNLOCK_POLL, \
     CMD_VIAL_LOCK, CMD_VIAL_QMK_SETTINGS_QUERY, CMD_VIAL_QMK_SETTINGS_GET, CMD_VIAL_QMK_SETTINGS_SET, \
-    CMD_VIAL_QMK_SETTINGS_RESET, BUFFER_FETCH_CHUNK, VIAL_PROTOCOL_QMK_SETTINGS
+    CMD_VIAL_QMK_SETTINGS_RESET, BUFFER_FETCH_CHUNK, VIAL_PROTOCOL_QMK_SETTINGS, CMD_VIA_CUSTOM_CHANNEL
 from protocol.dynamic import ProtocolDynamic
 from protocol.key_override import ProtocolKeyOverride
 from protocol.macro import ProtocolMacro
@@ -54,6 +54,8 @@ class Keyboard(ProtocolMacro, ProtocolDynamic, ProtocolTapDance, ProtocolCombo, 
         self.vibl = False
         self.custom_keycodes = None
         self.midi = None
+        # VIA v3 "menus" declaration (custom channel settings), if present
+        self.menus = None
 
         self.lighting_qmk_rgblight = self.lighting_qmk_backlight = self.lighting_vialrgb = False
 
@@ -158,6 +160,7 @@ class Keyboard(ProtocolMacro, ProtocolDynamic, ProtocolTapDance, ProtocolCombo, 
         self.cols = payload["matrix"]["cols"]
 
         self.custom_keycodes = payload.get("customKeycodes", None)
+        self.menus = payload.get("menus", None)
 
         serial = KleSerial()
         kb = serial.deserialize(payload["layouts"]["keymap"])
@@ -519,6 +522,20 @@ class Keyboard(ProtocolMacro, ProtocolDynamic, ProtocolTapDance, ProtocolCombo, 
 
     def qmk_settings_reset(self):
         self.usb_send(self.dev, struct.pack("BB", CMD_VIA_VIAL_PREFIX, CMD_VIAL_QMK_SETTINGS_RESET))
+
+    def custom_get_value(self, channel, value_id):
+        """ VIA custom channel GET: [0x08, channel, value_id] -> value bytes after the echo """
+        data = self.usb_send(self.dev, struct.pack(">BBB", CMD_VIA_LIGHTING_GET_VALUE, channel, value_id), retries=20)
+        return data[3:]
+
+    def custom_set_value(self, channel, value_id, payload):
+        """ VIA custom channel SET: [0x07, channel, value_id, payload...] """
+        self.usb_send(self.dev, struct.pack(">BBB", CMD_VIA_LIGHTING_SET_VALUE, channel, value_id) + bytes(payload),
+                      retries=20)
+
+    def custom_save(self, channel):
+        """ VIA custom channel SAVE: persist the channel's values to EEPROM """
+        self.usb_send(self.dev, struct.pack(">BB", CMD_VIA_LIGHTING_SAVE, channel), retries=20)
 
     def _vialrgb_set_mode(self):
         self.usb_send(self.dev, struct.pack("BBHBBBB", CMD_VIA_LIGHTING_SET_VALUE, VIALRGB_SET_MODE,

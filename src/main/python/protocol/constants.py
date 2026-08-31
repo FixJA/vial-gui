@@ -8,6 +8,10 @@ CMD_VIA_SET_KEYCODE = 0x05
 CMD_VIA_LIGHTING_SET_VALUE = 0x07
 CMD_VIA_LIGHTING_GET_VALUE = 0x08
 CMD_VIA_LIGHTING_SAVE = 0x09
+# The same 0x07/0x08/0x09 command ids carry the VIA "custom channel" when
+# data[1] == CMD_VIA_CUSTOM_CHANNEL; the keyboard definition's `menus`
+# section declares the controls living on that channel.
+CMD_VIA_CUSTOM_CHANNEL = 0
 CMD_VIA_MACRO_GET_COUNT = 0x0C
 CMD_VIA_MACRO_GET_BUFFER_SIZE = 0x0D
 CMD_VIA_MACRO_GET_BUFFER = 0x0E
