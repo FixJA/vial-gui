@@ -8,7 +8,8 @@ Wire format (same command ids as the legacy lighting commands):
     SET  [0x07, channel, value_id, value...]
     SAVE [0x09, channel]
 
-Supported item types: toggle, range, dropdown and color (hue/sat pair).
+Supported item types: toggle, range (rendered as a slider), dropdown and
+color (hue/sat pair rendered as a swatch opening a color dialog).
 Items may carry a "showIf" expression (VIA syntax: {id_name} references to
 other commands' current values, ==/!=/&&/|| and parentheses) controlling
 their visibility; hidden items are skipped when saving.
@@ -18,12 +19,14 @@ import re
 
 from PyQt5 import QtCore
 from PyQt5.QtCore import pyqtSignal, QObject
-from PyQt5.QtWidgets import QVBoxLayout, QCheckBox, QGridLayout, QLabel, QWidget, QSizePolicy, QTabWidget, QSpinBox, \
-    QComboBox, QHBoxLayout, QPushButton
+from PyQt5.QtGui import QColor
+from PyQt5.QtWidgets import QVBoxLayout, QCheckBox, QGridLayout, QLabel, QWidget, QSizePolicy, QTabWidget, \
+    QComboBox, QHBoxLayout, QPushButton, QSlider, QColorDialog
 
 from editor.basic_editor import BasicEditor
 from util import tr
 from vial_device import VialKeyboard
+from widgets.clickable_label import ClickableLabel
 
 _SHOWIF_REF = re.compile(r"\{(\w+)\}")
 
@@ -117,11 +120,12 @@ class CustomOption(QObject):
         """ Current control state serialized as bytes to send to the keyboard """
         raise NotImplementedError
 
-    def reload(self, keyboard):
-        self.value = keyboard.custom_get_value(self.channel, self.value_id)[:self.width]
+    def set_value(self, data):
+        """ Update the cached value and the widget state without HID traffic """
+        self.value = data
 
-    def sync(self):
-        self.value = self.wire_value()
+    def reload(self, keyboard):
+        self.set_value(keyboard.custom_get_value(self.channel, self.value_id)[:self.width])
 
     def dirty(self):
         return self.wire_value() != self.value
@@ -152,10 +156,10 @@ class ToggleOption(CustomOption):
     def wire_value(self):
         return bytes([int(self.checkbox.isChecked())])
 
-    def reload(self, keyboard):
-        super().reload(keyboard)
+    def set_value(self, data):
+        super().set_value(data)
         self.checkbox.blockSignals(True)
-        self.checkbox.setChecked(bool(self.value and self.value[0]))
+        self.checkbox.setChecked(bool(data and data[0]))
         self.checkbox.blockSignals(False)
 
     def delete(self):
@@ -172,28 +176,53 @@ class RangeOption(CustomOption):
         self.offset = item.get("offset", 0)
         lo, hi = item.get("options", [0, 255])
 
-        self.spinbox = QSpinBox()
-        self.spinbox.setMinimum(lo + self.offset)
-        self.spinbox.setMaximum(hi + self.offset)
-        self.spinbox.valueChanged.connect(self.on_change)
-        self.container.addWidget(self.spinbox, self.row, 1)
-        self._widgets.append(self.spinbox)
+        w = QWidget()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.slider = QSlider(QtCore.Qt.Horizontal)
+        self.slider.setMinimum(lo + self.offset)
+        self.slider.setMaximum(hi + self.offset)
+        self.slider.setMinimumWidth(160)
+        if hi - lo <= 10:
+            # short ranges (e.g. the 0-5 halo brightness) get one tick per step
+            self.slider.setTickPosition(QSlider.TicksBelow)
+            self.slider.setTickInterval(1)
+            self.slider.setPageStep(1)
+        self.value_label = QLabel()
+        self.value_label.setMinimumWidth(24)
+        self.slider.valueChanged.connect(self.on_slider_changed)
+        self.slider.valueChanged.connect(self.on_change)
+        layout.addWidget(self.slider)
+        layout.addWidget(self.value_label)
+        w.setLayout(layout)
+        self.container.addWidget(w, self.row, 1)
+        self._widgets.append(w)
+        self._display(self.slider.value())
+
+    def on_slider_changed(self, value):
+        self._display(value)
+
+    def _display(self, value):
+        self.value_label.setText(str(value))
 
     def wire_value(self):
-        v = self.spinbox.value() - self.offset
+        v = self.slider.value() - self.offset
         return v.to_bytes(self.width, byteorder="big")
 
-    def reload(self, keyboard):
-        super().reload(keyboard)
-        v = int.from_bytes(self.value.ljust(self.width, b"\x00"), byteorder="big")
-        self.spinbox.blockSignals(True)
-        self.spinbox.setValue(v + self.offset)
-        self.spinbox.blockSignals(False)
+    def set_value(self, data):
+        super().set_value(data)
+        v = int.from_bytes(data.ljust(self.width, b"\x00"), byteorder="big")
+        self.slider.blockSignals(True)
+        self.slider.setValue(v + self.offset)
+        self.slider.blockSignals(False)
+        self._display(v + self.offset)
 
     def delete(self):
         super().delete()
-        self.spinbox.hide()
-        self.spinbox.deleteLater()
+        self.slider.hide()
+        self.slider.deleteLater()
+        self.value_label.hide()
+        self.value_label.deleteLater()
 
 
 class DropdownOption(CustomOption):
@@ -223,13 +252,13 @@ class DropdownOption(CustomOption):
     def wire_value(self):
         return self.choices[self.combobox.currentIndex()]
 
-    def reload(self, keyboard):
-        super().reload(keyboard)
+    def set_value(self, data):
+        super().set_value(data)
         self.combobox.blockSignals(True)
+        self._unresolved = data not in self.choices
         index = 0
-        self._unresolved = self.value not in self.choices
         if not self._unresolved:
-            index = self.choices.index(self.value)
+            index = self.choices.index(data)
         self.combobox.setCurrentIndex(index)
         self.combobox.blockSignals(False)
 
@@ -247,46 +276,64 @@ class DropdownOption(CustomOption):
 
 
 class ColorOption(CustomOption):
-    """ hue/sat byte pair rendered as two spinboxes """
+    """ hue/sat byte pair rendered as a swatch that opens a color dialog """
 
     def __init__(self, item, container):
         super().__init__(item, container)
+        self.width = item.get("bytes", 2)
 
-        w = QWidget()
-        layout = QHBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.hue = QSpinBox()
-        self.hue.setRange(0, 255)
-        self.hue.valueChanged.connect(self.on_change)
-        self.sat = QSpinBox()
-        self.sat.setRange(0, 255)
-        self.sat.valueChanged.connect(self.on_change)
-        layout.addWidget(self.hue)
-        layout.addWidget(self.sat)
-        w.setLayout(layout)
-        self.container.addWidget(w, self.row, 1)
-        self._widgets.append(w)
+        self.hue8 = 0
+        self.sat8 = 0
+        self.swatch = ClickableLabel()
+        self.swatch.setMinimumSize(48, 22)
+        self.swatch.clicked.connect(self.on_pick_color)
+        self.container.addWidget(self.swatch, self.row, 1)
+        self._widgets.append(self.swatch)
+        self._update_swatch()
+
+    def current_color(self):
+        # value comes from the side-light brightness, not stored in the pair;
+        # show the hue/sat at full value so dark settings stay previewable
+        return QColor.fromHsvF(self.hue8 / 255, self.sat8 / 255, 1.0)
+
+    def _update_swatch(self):
+        self.swatch.setStyleSheet(
+            "QLabel { background-color: %s; border: 1px solid #888; }" % self.current_color().name())
+
+    def on_pick_color(self):
+        self.dlg_color = QColorDialog()
+        self.dlg_color.setModal(True)
+        self.dlg_color.finished.connect(self.on_color_picked)
+        self.dlg_color.setCurrentColor(self.current_color())
+        self.dlg_color.show()
+
+    def on_color_picked(self):
+        color = self.dlg_color.selectedColor()
+        if not color.isValid():
+            return
+        h, s, v, a = color.getHsvF()
+        if s > 0:
+            self.hue8 = int(h * 255 + 0.5) % 256
+        else:
+            # achromatic: Qt reports an arbitrary hue, keep the stored one
+            pass
+        self.sat8 = max(0, min(255, int(s * 255 + 0.5)))
+        self._update_swatch()
+        self.on_change()
 
     def wire_value(self):
-        return bytes([self.hue.value(), self.sat.value()])
+        return bytes([self.hue8, self.sat8])
 
-    def reload(self, keyboard):
-        super().reload(keyboard)
-        hue = self.value[0] if len(self.value) > 0 else 0
-        sat = self.value[1] if len(self.value) > 1 else 0
-        self.hue.blockSignals(True)
-        self.sat.blockSignals(True)
-        self.hue.setValue(hue)
-        self.sat.setValue(sat)
-        self.hue.blockSignals(False)
-        self.sat.blockSignals(False)
+    def set_value(self, data):
+        super().set_value(data)
+        self.hue8 = data[0] if len(data) > 0 else 0
+        self.sat8 = data[1] if len(data) > 1 else 0
+        self._update_swatch()
 
     def delete(self):
         super().delete()
-        self.hue.hide()
-        self.hue.deleteLater()
-        self.sat.hide()
-        self.sat.deleteLater()
+        self.swatch.hide()
+        self.swatch.deleteLater()
 
 
 OPTION_TYPES = {
@@ -384,21 +431,25 @@ class CustomSettings(BasicEditor):
     def apply_visibility(self):
         """ Re-evaluate showIf for every item against current command values.
 
-        Values come from the widget state for visible+dirty items and from the
-        last value read from the keyboard otherwise, so stale hidden widgets
-        (e.g. a variant dropdown whose choices don't contain the active wire
-        value) never feed the expressions.
+        Values come from the widget state for visible items and from the last
+        value read from the keyboard otherwise, so stale hidden widgets (e.g.
+        a variant dropdown whose choices don't contain the active wire value)
+        never feed the expressions.
         """
         values = {}
+        # several controls may share one command (e.g. the color variant
+        # dropdowns); the state of the visible control must always win over
+        # cached values of hidden ones, whether or not it is dirty
         for tab in self.tabs:
             for opt in tab:
-                v = opt.wire_value() if (opt.visible and opt.dirty()) else opt.value
-                v = int.from_bytes(v or b"\x00", byteorder="big")
-                # several controls may share one command (e.g. the color
-                # variant dropdowns); the visible+dirty one reflects the
-                # user's edit and must not be overwritten by hidden widgets
-                if opt.name not in values or (opt.visible and opt.dirty()):
-                    values[opt.name] = v
+                if not opt.visible or opt.name in values:
+                    continue
+                v = opt.wire_value() if opt.dirty() else opt.value
+                values[opt.name] = int.from_bytes(v or b"\x00", byteorder="big")
+        for tab in self.tabs:
+            for opt in tab:
+                if opt.name not in values:
+                    values[opt.name] = int.from_bytes(opt.value or b"\x00", byteorder="big")
         for tab in self.tabs:
             for opt in tab:
                 if opt.showif:
@@ -423,12 +474,21 @@ class CustomSettings(BasicEditor):
 
     def save_settings(self):
         channels = set()
+        saved = {}
         for tab in self.tabs:
             for opt in tab:
                 if opt.dirty() and opt.visible:
-                    self.keyboard.custom_set_value(opt.channel, opt.value_id, opt.wire_value())
-                    opt.sync()
+                    data = opt.wire_value()
+                    self.keyboard.custom_set_value(opt.channel, opt.value_id, data)
+                    saved[opt.name] = data
                     channels.add(opt.channel)
+        # every control sharing a saved command name (e.g. the variant
+        # dropdowns) must follow the saved value instead of its stale cache
+        if saved:
+            for tab in self.tabs:
+                for opt in tab:
+                    if opt.name in saved:
+                        opt.set_value(saved[opt.name])
         for channel in channels:
             self.keyboard.custom_save(channel)
         self.on_change()
