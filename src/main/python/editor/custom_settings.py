@@ -16,6 +16,7 @@ their visibility; hidden items are skipped when saving.
 """
 import ast
 import re
+import sys
 
 from PyQt5 import QtCore
 from PyQt5.QtCore import pyqtSignal, QObject
@@ -29,6 +30,7 @@ from vial_device import VialKeyboard
 from widgets.clickable_label import ClickableLabel
 
 _SHOWIF_REF = re.compile(r"\{(\w+)\}")
+_SHOWIF_WARNED = set()
 
 
 def _safe_eval_bool(expr):
@@ -76,15 +78,24 @@ def eval_showif(expr, values):
     """Evaluate a VIA showIf expression such as '{id_a} == 0 || {id_b} == 2'.
 
     values maps command names (content[0]) to their current integer wire value;
-    unknown references read as 0. Syntax errors fail open (returns True).
+    unknown references read as 0 (warned once, they usually mean a typo in the
+    keyboard definition). Syntax errors fail open (returns True).
     """
     if not expr:
         return True
 
+    unknown = []
+
     def repl(m):
+        if m.group(1) not in values:
+            unknown.append(m.group(1))
         return str(values.get(m.group(1), 0))
 
     py = _SHOWIF_REF.sub(repl, expr.replace("||", " or ").replace("&&", " and "))
+    if unknown and expr not in _SHOWIF_WARNED:
+        _SHOWIF_WARNED.add(expr)
+        print("warning: showIf references unknown commands (%s) in %r" % (", ".join(sorted(set(unknown))), expr),
+              file=sys.stderr)
     try:
         return bool(_safe_eval_bool(py))
     except (ValueError, SyntaxError):
@@ -125,7 +136,11 @@ class CustomOption(QObject):
         self.value = data
 
     def reload(self, keyboard):
-        self.set_value(keyboard.custom_get_value(self.channel, self.value_id)[:self.width])
+        # pad short device answers to the declared width so dirty comparison
+        # stays width-consistent (a 1-byte answer to a 2-byte control would
+        # otherwise read as permanently dirty)
+        data = keyboard.custom_get_value(self.channel, self.value_id)[:self.width]
+        self.set_value(data.ljust(self.width, b"\x00"))
 
     def dirty(self):
         return self.wire_value() != self.value
@@ -174,6 +189,7 @@ class RangeOption(CustomOption):
         super().__init__(item, container)
 
         self.offset = item.get("offset", 0)
+        self.unit = item.get("unit", "")
         lo, hi = item.get("options", [0, 255])
 
         w = QWidget()
@@ -203,7 +219,7 @@ class RangeOption(CustomOption):
         self._display(value)
 
     def _display(self, value):
-        self.value_label.setText(str(value))
+        self.value_label.setText(str(value) + self.unit)
 
     def wire_value(self):
         v = self.slider.value() - self.offset
@@ -246,23 +262,50 @@ class DropdownOption(CustomOption):
         self._widgets.append(self.combobox)
         # set when the loaded value has no entry in this dropdown's choices
         # (possible for one of several controls sharing a command while
-        # another variant is active); suppress dirty until the user picks
+        # another variant is active); dirty is suppressed until the user picks
         self._unresolved = False
+        # while unresolved an inert "(current: N)" item is parked at index 0
+        # so no real choice is displayed wrongly; removed on first user pick
+        self._placeholder = False
 
     def wire_value(self):
         return self.choices[self.combobox.currentIndex()]
+
+    def _show_placeholder(self, data):
+        text = tr("CustomSettings", "(current: %d)") % int.from_bytes(data, byteorder="big")
+        if self._placeholder:
+            self.combobox.setItemText(0, text)
+        else:
+            self.combobox.insertItem(0, text)
+            self._placeholder = True
+        self.combobox.setCurrentIndex(0)
+
+    def _remove_placeholder(self):
+        if self._placeholder:
+            self.combobox.removeItem(0)
+            self._placeholder = False
 
     def set_value(self, data):
         super().set_value(data)
         self.combobox.blockSignals(True)
         self._unresolved = data not in self.choices
-        index = 0
-        if not self._unresolved:
-            index = self.choices.index(data)
-        self.combobox.setCurrentIndex(index)
+        if self._unresolved:
+            self._show_placeholder(data)
+        else:
+            self._remove_placeholder()
+            self.combobox.setCurrentIndex(self.choices.index(data))
         self.combobox.blockSignals(False)
 
     def on_change(self):
+        if self._placeholder:
+            # dropping the placeholder shifts real options back by one so
+            # currentIndex maps onto choices again
+            self.combobox.blockSignals(True)
+            index = max(0, self.combobox.currentIndex() - 1)
+            self.combobox.removeItem(0)
+            self.combobox.setCurrentIndex(index)
+            self.combobox.blockSignals(False)
+            self._placeholder = False
         self._unresolved = False
         super().on_change()
 
@@ -281,6 +324,8 @@ class ColorOption(CustomOption):
     def __init__(self, item, container):
         super().__init__(item, container)
         self.width = item.get("bytes", 2)
+        if self.width != 2:
+            raise ValueError("color controls carry a 2-byte hue/sat pair, got bytes=%d" % self.width)
 
         self.hue8 = 0
         self.sat8 = 0
@@ -472,25 +517,44 @@ class CustomSettings(BasicEditor):
             self.keyboard = device.keyboard
             self.reload_settings()
 
+    @staticmethod
+    def _flash_btn(btn, text):
+        """Show `text` on the button for a moment, then restore its label"""
+        btn.setText(text)
+        QtCore.QTimer.singleShot(1500, lambda: btn.setText(tr("CustomSettings", "Save")))
+
     def save_settings(self):
-        channels = set()
-        saved = {}
-        for tab in self.tabs:
-            for opt in tab:
-                if opt.dirty() and opt.visible:
-                    data = opt.wire_value()
-                    self.keyboard.custom_set_value(opt.channel, opt.value_id, data)
-                    saved[opt.name] = data
-                    channels.add(opt.channel)
-        # every control sharing a saved command name (e.g. the variant
-        # dropdowns) must follow the saved value instead of its stale cache
-        if saved:
+        try:
+            channels = set()
+            saved = {}
             for tab in self.tabs:
                 for opt in tab:
-                    if opt.name in saved:
-                        opt.set_value(saved[opt.name])
-        for channel in channels:
-            self.keyboard.custom_save(channel)
+                    if opt.dirty() and opt.visible:
+                        data = opt.wire_value()
+                        self.keyboard.custom_set_value(opt.channel, opt.value_id, data)
+                        saved[opt.name] = data
+                        channels.add(opt.channel)
+            # every control sharing a saved command name (e.g. the variant
+            # dropdowns) must follow the saved value instead of its stale cache
+            if saved:
+                for tab in self.tabs:
+                    for opt in tab:
+                        if opt.name in saved:
+                            opt.set_value(saved[opt.name])
+            for channel in channels:
+                self.keyboard.custom_save(channel)
+            # re-read everything the firmware actually kept: the device is the
+            # source of truth and may clamp values below what was sent
+            if channels:
+                for tab in self.tabs:
+                    for opt in tab:
+                        opt.reload(self.keyboard)
+        except Exception as e:
+            print("custom settings save failed: %s" % e, file=sys.stderr)
+            self._flash_btn(self.btn_save, tr("CustomSettings", "Save failed"))
+            return
+        if channels:
+            self._flash_btn(self.btn_save, tr("CustomSettings", "Saved ✓"))
         self.on_change()
 
     def valid(self):
