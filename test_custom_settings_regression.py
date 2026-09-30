@@ -8,6 +8,11 @@ Covers:
      saving does not wipe saturation
   3. "range" items render as a slider with the right wire values
   4. the color swatch dialog callback maps QColor -> hue/sat bytes
+  5. a loaded value outside a variant dropdown's choices shows a
+     "(current: N)" placeholder instead of a wrong first choice
+  6. saving re-reads the device: widgets follow what the firmware kept
+     (clamping below the sent value), not what was sent
+  7. slider-ized menus render the "unit" suffix (ms / m) and offsets
 
 Run:  venv/Scripts/python.exe test_custom_settings_regression.py
 """
@@ -153,10 +158,78 @@ def test_color_picker_mapping():
     assert static.wire_value() == bytes([128, 0])
 
 
+def test_unresolved_placeholder():
+    cs, kb = make_cs()
+    # Wave + Rainbow/Auto stores side_color = 2
+    find(cs, "Color Variant", visible=True).combobox.setCurrentIndex(2)
+    cs.save_settings()
+    assert kb.store[(0, 12)] == b"\x02"
+
+    # Static's variant dropdown has no Rainbow choice -> inert placeholder,
+    # never a wrongly-displayed real choice
+    find(cs, "Side Mode").combobox.setCurrentIndex(4)
+    variant = find(cs, "Color Variant", visible=True)
+    assert variant._unresolved and variant._placeholder
+    assert variant.combobox.itemText(0).startswith("(current: 2)")
+    assert variant.combobox.currentIndex() == 0
+    assert not variant.dirty(), "unresolved dropdown must not count as dirty"
+
+    # picking a real option drops the placeholder and realigns the index
+    variant.combobox.setCurrentIndex(2)  # 'Custom Color' behind the placeholder
+    assert not variant._placeholder and variant.combobox.count() == 2
+    assert variant.combobox.currentIndex() == 1
+    assert variant.dirty() and variant.wire_value() == b"\x01"
+    cs.save_settings()
+    assert kb.store[(0, 12)] == b"\x01"
+    assert not variant.dirty() and variant.combobox.currentIndex() == 1
+
+
+def test_save_rereads_device():
+    cs, kb = make_cs()
+    orig_set = kb.custom_set_value
+
+    def clamping_set(channel, value_id, data):
+        if value_id == 13 and data[0] > 3:
+            data = b"\x03"  # pretend the firmware clamps brightness to 3
+        orig_set(channel, value_id, data)
+
+    kb.custom_set_value = clamping_set
+    bright = find(cs, "Brightness")
+    bright.slider.setValue(5)
+    assert bright.dirty()
+    cs.save_settings()
+    # the widget follows what the device kept, not what was sent
+    assert kb.store[(0, 13)] == b"\x03"
+    assert bright.slider.value() == 3 and bright.value_label.text() == "3"
+    assert not bright.dirty() and not cs.btn_save.isEnabled()
+
+
+def test_range_unit_suffix():
+    cs, kb = make_cs()
+    deb = find(cs, "Debounce Press")
+    assert isinstance(deb, RangeOption)
+    assert (deb.slider.minimum(), deb.slider.maximum()) == (0, 30)
+    assert deb.unit == "ms" and deb.value_label.text() == "0ms"
+    deb.slider.setValue(12)
+    assert deb.wire_value() == b"\x0c" and deb.value_label.text() == "12ms"
+    cs.save_settings()
+    assert kb.store[(0, 1)] == b"\x0c"
+    assert deb.value_label.text() == "12ms" and not deb.dirty()
+
+    timeout = find(cs, "Sleep Timeout")  # hidden while Sleep Enable is off
+    assert (timeout.slider.minimum(), timeout.slider.maximum()) == (1, 60)
+    assert timeout.value_label.text() == "1m"
+    timeout.slider.setValue(30)
+    assert timeout.wire_value() == bytes([29]) and timeout.value_label.text() == "30m"
+
+
 def main():
     tests = [test_variant_save_keeps_rows_stable,
              test_range_renders_as_slider,
-             test_color_picker_mapping]
+             test_color_picker_mapping,
+             test_unresolved_placeholder,
+             test_save_rereads_device,
+             test_range_unit_suffix]
     failed = 0
     for t in tests:
         try:
